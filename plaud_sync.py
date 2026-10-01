@@ -25,6 +25,10 @@
   그 녹음 때문에 실행 전체를 실패로 끝내지 않는다. 요약 노트면 요약이 없는 것으로 보고 대기/시간 초과
   흐름을 따르고, 다른 노트면 그 노트 없이 내보내며 본문에 빠진 노트를 적는다.
   실패 횟수는 state["failures"][id]에 적고, 내보내거나 노트를 가져오면 지운다.
+- MCP 서버는 항상 최신판(@latest)이라 응답 형식이 예고 없이 바뀔 수 있다. 그래서 파일을 쓰기 전에
+  자체 검사(녹음 시각, 전사 개수, 전사 필드, 요약 본문, 완성된 파일)를 하고, 하나라도 어긋나면
+  쓰지 않는다(FormatCheckError). 그 녹음은 exported에 넣지 않고 pending도 그대로 두며, 검사마다
+  알림은 한 번만 띄운다(state["format_alerts"]). 종료 코드는 4. --force로도 건너뛸 수 없다.
 
 사용법:
   python3 plaud_sync.py                 # 최근 녹음 확인 후 새로 전사된 것만 내보내기
@@ -60,6 +64,7 @@ CALL_TIMEOUT = 120        # 도구 호출 하나당 최대 대기(초)
 SLUG_MAX = 40
 DEFAULT_NOTE_WAIT_HOURS = 24
 DEFAULT_MAX_RETRIES = 10  # 노트 본문 가져오기 연속 실패 허용 횟수(10분 주기면 약 100분)
+EXIT_FORMAT = 4  # 종료 코드: 0 정상, 1 일시적 실패, 2 설정 오류, 3 로그인 필요, 4 형식 검사 실패
 PENDING_GRACE = dt.timedelta(days=7)  # 요약 대기 시간에 더해, 처리 못 한 대기 기록을 지우기까지의 여유
 # 네트워크, 시간 초과, 서버 오류(5xx), 요청 과다(429)는 일시적인 오류로 보고 실패 횟수에 넣지 않는다.
 TRANSIENT_RE = re.compile(
@@ -71,6 +76,19 @@ NOT_FOUND_RE = re.compile(r"\b404\b|\bnot found\b", re.I)
 SUMMARY_NOTE_TYPE = "auto_sum_note"
 
 UNTRUSTED_RE = re.compile(r"<(untrusted-user-data-[0-9a-f]+)[^>]*>\n(.*)\n</\1>", re.S)
+# Plaud 앱에서만 열리는 링크/이미지(예: 요약 첫 줄의 [](plaud://image?type=summaryCard&id=...)). Obsidian에서는 깨진다.
+# 링크 글자 안의 대괄호 한 겹, 주소 안의 괄호 한 겹, 뒤의 "제목"까지 링크 하나로 본다(일부만 지워 찌꺼기가 남지 않게).
+PLAUD_LINK_RE = re.compile(
+    r'!?\[(?:[^\[\]\n]|\[[^\[\]\n]*\])*\]\(plaud://(?:[^()\s]|\([^()\s]*\))*(?:\s+"[^"\n]*")?\)')
+
+# 자체 검사 기준값
+MIN_RECORDED_YEAR = 2015          # 이보다 이른 녹음 시각은 단위나 형식이 바뀐 것으로 본다
+FUTURE_SLACK = dt.timedelta(days=1)  # 녹음 시각이 지금보다 이만큼 넘게 미래면 이상으로 본다
+MAX_EMPTY_RATIO = 0.5             # 내용이 빈 전사 구간이 이 비율을 넘으면(전부 빈 경우 포함) 형식 변경으로 본다
+MAX_MISSING_START_RATIO = 0.5     # start_time이 없는 구간이 이 비율을 넘으면 형식 변경으로 본다
+DURATION_SLACK_MS = 60000         # 마지막 구간 시작이 녹음 길이(duration)를 이만큼 넘게 지나면 단위 변경으로 본다
+LEAK_MARKERS = ("untrusted-user-data", "Note: source_list")  # MCP 응답의 감싸개, 꼬리 안내문
+TRANSCRIPT_HEADING = "## 전사"
 
 
 def log(msg):
@@ -97,6 +115,15 @@ class AuthError(Exception):
 
 class NotFoundError(RuntimeError):
     """도구가 isError로 404(녹음 없음)를 돌려줌. 네트워크 등 일시적 오류와는 구분한다."""
+
+
+class FormatCheckError(Exception):
+    """자체 검사 실패. 일시적 오류가 아니라 API 응답 형식이 바뀐 것으로 본다(파일을 쓰지 않음)."""
+
+    def __init__(self, check, detail):
+        Exception.__init__(self, "%s: %s" % (check, detail))
+        self.check = check
+        self.detail = detail
 
 
 class McpClient:
@@ -232,7 +259,10 @@ def parse_time(value):
         value = float(value)
     if isinstance(value, (int, float)):
         secs = value / 1000.0 if value > 1e11 else float(value)
-        return dt.datetime.fromtimestamp(secs)
+        try:
+            return dt.datetime.fromtimestamp(secs)
+        except (OverflowError, OSError, ValueError):  # 범위를 벗어난 값은 해석 실패로 본다
+            return None
     s = str(value).strip().replace("Z", "+00:00").replace("z", "+00:00")
     # Python 3.9 fromisoformat은 소수초 3/6자리, 오프셋 +HH:MM만 받는다
     s = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
@@ -247,8 +277,8 @@ def parse_time(value):
 
 
 def recorded_time(file):
-    """녹음 시각. start_time이 없거나 해석에 실패하면 created_at을 쓴다."""
-    for key in ("start_time", "created_at"):
+    """녹음 시작 시각. Plaud API는 start_at(UTC)에 준다. created_at은 업로드 시각이라 마지막 대안으로만 쓴다."""
+    for key in ("start_at", "start_time", "created_at"):
         d = parse_time(file.get(key)) if isinstance(file, dict) else None
         if d:
             return d
@@ -345,19 +375,152 @@ def has_summary(notes):
     return False
 
 
+def is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def fetch_transcript(client, file_id):
-    segments, cursor = [], None
+    """전사 구간을 모든 페이지에서 모은다. 검사 2(transcript_count): 페이지마다 segments가 목록이고
+    returned, offset이 실제와 맞는지, next_cursor가 반복되거나 빈 페이지에서 이어지지 않는지,
+    끝에서 모은 개수가 total과 같은지 본다(각 필드는 응답에 있을 때만)."""
+    segments, cursor, used, total = [], None, set(), None
     while True:
         args = {"file_id": file_id, "limit": 500}
         if cursor:
             args["cursor"] = cursor
         data = client.call_json("get_transcript", **args)
         if not isinstance(data, dict):
-            raise RuntimeError("전사 형식을 알 수 없음: %s" % str(data)[:200])
-        segments.extend(data.get("segments") or [])
+            raise FormatCheckError("transcript_count", "get_transcript 결과가 JSON 객체가 아님: %s" % str(data)[:200])
+        page = data.get("segments")
+        if not isinstance(page, list):
+            raise FormatCheckError("transcript_count", "get_transcript 결과에 segments 목록이 없음")
+        returned, offset = data.get("returned"), data.get("offset")
+        if is_number(returned) and returned != len(page):
+            raise FormatCheckError("transcript_count", "returned=%s인데 받은 구간은 %d개" % (returned, len(page)))
+        if is_number(offset) and offset != len(segments):
+            raise FormatCheckError("transcript_count", "offset=%s인데 앞서 받은 구간은 %d개" % (offset, len(segments)))
+        if is_number(data.get("total")):
+            if total is not None and data["total"] != total:
+                raise FormatCheckError("transcript_count", "페이지마다 total이 다름(%s, %s)" % (total, data["total"]))
+            total = data["total"]
+        segments.extend(page)
         cursor = data.get("next_cursor")
         if not cursor:
-            return segments
+            break
+        if not page or cursor in used:
+            raise FormatCheckError("transcript_count", "next_cursor가 끝나지 않음(빈 페이지이거나 같은 커서 반복)")
+        used.add(cursor)
+    if total is not None and len(segments) != total:
+        raise FormatCheckError("transcript_count", "total=%s인데 모은 구간은 %d개" % (total, len(segments)))
+    return segments
+
+
+def segment_text(seg):
+    """전사 구간 본문. 한 구간이 한 줄이 되도록 줄바꿈은 공백으로 바꾼다."""
+    return re.sub(r"\s*\n\s*", " ", str(first(seg, "content", "text", "sentence") or ""))
+
+
+def check_recorded_time(file):
+    """검사 1(recorded_time): 녹음 시각을 해석할 수 있고 상식적인 범위에 있어야 한다. 오늘 날짜로 대신하지 않는다."""
+    d = recorded_time(file)
+    if d is None:
+        raise FormatCheckError("recorded_time", "녹음 시각(start_at, start_time, created_at)을 해석할 수 없음: %s"
+                               % {k: file.get(k) for k in ("start_at", "start_time", "created_at")})
+    # 앞 순위 필드가 값은 있는데 해석되지 않으면(형식 변경) 업로드 시각 같은 뒤 순위 값으로 조용히 넘어가지 않는다
+    for key in ("start_at", "start_time"):
+        v = file.get(key)
+        if v in (None, ""):
+            continue
+        if parse_time(v) is None:
+            raise FormatCheckError("recorded_time", "%s 값을 해석할 수 없음: %r" % (key, v))
+        break
+    if d.year < MIN_RECORDED_YEAR or d > dt.datetime.now() + FUTURE_SLACK:
+        raise FormatCheckError("recorded_time", "녹음 시각이 비정상 범위: %s" % d.isoformat(timespec="seconds"))
+    return d
+
+
+def check_segments(segments, file):
+    """검사 3(segment_fields): 렌더링에 쓰는 필드가 그대로 있는지 본다.
+    - 모든 구간이 객체(dict)여야 한다.
+    - 본문이 빈 구간은 일부 허용하지만 MAX_EMPTY_RATIO(절반)를 넘으면 실패(전부 빈 경우 포함).
+    - start_time은 있으면 숫자여야 하고(하나라도 문자열 등이면 실패), 없는 구간이 절반을 넘으면 실패.
+    - speaker(또는 original_speaker)가 모든 구간에 없으면 실패.
+    - get_file의 duration(밀리초)이 숫자면, 가장 늦은 start_time이 duration + 1분을 넘으면 실패(단위 변경)."""
+    n = len(segments)
+    if any(not isinstance(s, dict) for s in segments):
+        raise FormatCheckError("segment_fields", "전사 구간 중 객체가 아닌 항목이 있음")
+    empty = sum(1 for s in segments if not segment_text(s).strip())
+    if empty > n * MAX_EMPTY_RATIO:
+        raise FormatCheckError("segment_fields", "본문이 빈 전사 구간이 %d/%d개" % (empty, n))
+    starts = [first(s, "start_time", "start", "begin") for s in segments]
+    bad = [v for v in starts if v is not None and not is_number(v)]
+    if bad:
+        raise FormatCheckError("segment_fields", "start_time이 숫자가 아님: %r" % (bad[0],))
+    missing = sum(1 for v in starts if v is None)
+    if missing > n * MAX_MISSING_START_RATIO:
+        raise FormatCheckError("segment_fields", "start_time이 없는 전사 구간이 %d/%d개" % (missing, n))
+    if not any(first(s, "speaker", "original_speaker") for s in segments):
+        raise FormatCheckError("segment_fields", "모든 전사 구간에 speaker가 없음")
+    dur = file.get("duration")
+    nums = [v for v in starts if v is not None]
+    if is_number(dur) and dur > 0 and nums and max(nums) > dur + DURATION_SLACK_MS:
+        raise FormatCheckError("segment_fields", "마지막 구간 시작(%s)이 녹음 길이(%s)보다 김(단위 변경 의심)"
+                               % (max(nums), dur))
+
+
+def strip_plaud_links(text):
+    """Plaud 앱 전용 링크/이미지([..](plaud://..), ![..](plaud://..))만 지운다. 그 링크만 있던 줄은
+    줄째 지우고, 그 때문에 빈 줄이 겹치거나 맨 앞에 남지 않게 한다. 다른 내용은 바꾸지 않는다."""
+    out, dropped = [], False
+    for line in str(text).split("\n"):
+        new = PLAUD_LINK_RE.sub("", line)
+        if new != line and not new.strip():
+            dropped = True  # 링크만 있던 줄
+            continue
+        if dropped and not line.strip() and (not out or not out[-1].strip()):
+            continue  # 지운 줄 때문에 생긴 연속 빈 줄, 맨 앞 빈 줄
+        dropped = False
+        out.append(new)
+    return "\n".join(out)
+
+
+def note_body(note):
+    return strip_plaud_links(note.get("data_content") or "").strip()
+
+
+def check_summary(file, notes, summary_lost):
+    """검사 4(summary_body): 요약이 있다고 보는 노트(has_summary 기준)는 plaud:// 링크를 지운 본문이
+    비어 있으면 안 된다. get_file의 note_list에는 요약이 있는데 get_note 결과에서 사라져도 실패.
+    (본문 가져오기 실패가 한도에 닿아 요약을 뺀 경우 summary_lost는 제외)"""
+    for n in notes:
+        if is_summary_note(n) and (n.get("data_content") or n.get("data_link")) and not note_body(n):
+            raise FormatCheckError("summary_body", "요약 노트(%s) 본문이 비어 있음"
+                                   % (first(n, "data_title", "data_type") or "노트"))
+    if not summary_lost and has_summary(file.get("note_list")) and not has_summary(notes):
+        raise FormatCheckError("summary_body", "get_file에는 요약이 있는데 get_note 결과에 없음")
+
+
+def check_rendered(content, fid, n_segments):
+    """검사 5(rendered_file): 쓰기 직전 완성된 파일을 본다. frontmatter의 plaud_id가 이 녹음이고
+    recorded_at이 비어 있지 않은지, 전사 줄 수가 구간 수와 같은지, MCP 감싸개나 꼬리 안내문이
+    섞이지 않았는지."""
+    m = re.match(r"---\n(.*?)\n---\n", content, re.S)
+    if not m:
+        raise FormatCheckError("rendered_file", "frontmatter를 찾을 수 없음")
+    fm = m.group(1)
+    if not re.search(r'^plaud_id: "%s"$' % re.escape(fid), fm, re.M):
+        raise FormatCheckError("rendered_file", "frontmatter의 plaud_id가 없거나 다름")
+    if not re.search(r"^recorded_at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}$", fm, re.M):
+        raise FormatCheckError("rendered_file", "frontmatter의 recorded_at이 비어 있거나 형식이 다름")
+    parts = content.rsplit("\n%s\n" % TRANSCRIPT_HEADING, 1)
+    if len(parts) != 2:
+        raise FormatCheckError("rendered_file", "전사 제목(%s)이 없음" % TRANSCRIPT_HEADING)
+    lines = [l for l in parts[1].split("\n") if l.strip()]
+    if len(lines) != n_segments:
+        raise FormatCheckError("rendered_file", "전사 줄 %d개, 구간 %d개" % (len(lines), n_segments))
+    for marker in LEAK_MARKERS:
+        if marker in content:
+            raise FormatCheckError("rendered_file", "MCP 응답 문구(%s)가 본문에 섞임" % marker)
 
 
 def render(file, notes, segments, no_summary_reason=None, missing_notes=None):
@@ -384,14 +547,14 @@ def render(file, notes, segments, no_summary_reason=None, missing_notes=None):
         lines += ["> 가져오지 못한 Plaud 노트: %s (본문을 여러 번 받지 못해 빼고 넣었습니다)"
                   % ", ".join(missing_notes), ""]
     for note in notes if isinstance(notes, list) else []:
-        body = note.get("data_content")
+        body = note_body(note)
         if not body:
             continue
         head = first(note, "data_title", "title", "data_type") or "노트"
-        lines += ["## Plaud 노트: %s" % head, "", str(body).strip(), ""]
-    lines += ["## 전사", ""]
+        lines += ["## Plaud 노트: %s" % head, "", body, ""]
+    lines += [TRANSCRIPT_HEADING, ""]
     for seg in segments:
-        text = first(seg, "content", "text", "sentence") or ""
+        text = segment_text(seg)
         speaker = first(seg, "speaker", "original_speaker") or ""
         ts = fmt_ts(first(seg, "start_time", "start", "begin"))
         prefix = "[%s] " % ts if ts else ""
@@ -433,7 +596,10 @@ def list_candidates(client, args):
     out, seen_ids = [], set()
     for p in range(1, pages + 1):
         data = client.call_json("list_files", page=p, page_size=PAGE_SIZE)
-        items = data.get("data", []) if isinstance(data, dict) else []
+        # 형식이 바뀌어 목록을 못 읽으면 "새 녹음 0건"으로 조용히 넘어가지 않도록 검사한다
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise FormatCheckError("list_format", "list_files 결과에 data 목록이 없음: %s" % str(data)[:200])
+        items = data["data"]
         items = [it for it in items if isinstance(it, dict) and it.get("id")]
         if not items:  # 빈 페이지 = 끝
             break
@@ -443,9 +609,14 @@ def list_candidates(client, args):
         stop = False
         for it in new:
             seen_ids.add(it["id"])
-            created = recorded_time(it)
-            if since and created and created < since:
+            # 목록은 업로드 시각(created_at) 순이다. 녹음 시각 <= 업로드 시각이므로, 업로드가 since보다
+            # 이르면 그 뒤 항목도 대상이 아니라고 보고 멈춘다. 늦게 업로드된 옛 녹음 때문에 멈추지 않도록
+            # 멈춤 판단은 created_at으로, 거르기는 녹음 시각으로 한다.
+            uploaded = parse_time(it.get("created_at"))
+            if since and uploaded and uploaded < since:
                 stop = True
+            recorded = recorded_time(it)
+            if since and recorded and recorded < since:
                 continue
             out.append(it)
         # 페이지 크기가 PAGE_SIZE보다 작아도 끝이라고 단정하지 않는다(서버가 상한을 둘 수 있음).
@@ -521,17 +692,30 @@ def run(args):
         seen = pending_seen(pending, fid)
         return seen is not None and dt.datetime.now() - seen > pending_cap
 
+    def save():
+        if not args.dry_run:
+            save_state(state)
+
+    passed, format_failed = set(), {}  # 이번 실행에서 통과한 검사, 실패한 검사 → 첫 실패 설명
+
     client = McpClient()
     try:
-        candidates = list_candidates(client, args)
+        try:
+            candidates = list_candidates(client, args)
+        except FormatCheckError as e:
+            log_format_failure(e, "list_files")
+            update_format_alerts(state, passed, {e.check: "list_files: %s" % e.detail}, args.dry_run)
+            return EXIT_FORMAT
+        if not args.id:
+            passed.add("list_format")
         dirty = False
         for book in (pending, failures):  # 이미 내보낸 녹음의 대기 기록, 실패 횟수 정리
             for fid in list(book):
                 if fid in exported or fid in in_raw:
                     del book[fid]
                     dirty = True
-        if dirty and not args.dry_run:
-            save_state(state)
+        if dirty:
+            save()
         todo = [c for c in candidates
                 if args.force or (c["id"] not in exported and c["id"] not in in_raw)]
         # 요약을 기다리는 녹음이 최근 목록 밖으로 밀려났어도 get_file로 다시 확인한다 (--id 실행은 제외)
@@ -542,7 +726,7 @@ def run(args):
         log("확인 %d건, 미내보냄 %d건%s" % (len(candidates), len(todo),
             ", 목록 밖 요약 대기 %d건 재확인" % len(rechecks) if rechecks else ""))
         todo += rechecks
-        done = waiting = summary_waiting = failed = 0
+        done = planned = waiting = summary_waiting = failed = 0
         authed = not args.id  # list_files가 성공했으면 로그인된 상태 (--id면 get_file 성공으로 판단)
         for item in todo:
             fid = item["id"]
@@ -555,7 +739,8 @@ def run(args):
                     drop_pending(fid, "Plaud에서 녹음을 찾을 수 없음(삭제된 것으로 봄)")
                     continue
                 if not isinstance(file, dict):
-                    raise RuntimeError("get_file 형식 오류")
+                    raise FormatCheckError("get_file_format", "get_file 결과가 JSON 객체가 아님: %s" % str(file)[:200])
+                passed.add("get_file_format")
                 file.setdefault("id", fid)
                 authed = True
                 if not transcript_ready(file):
@@ -565,6 +750,9 @@ def run(args):
                     waiting += 1
                     continue
                 title = first(file, "name", "filename", "title") or "녹음"
+                # 검사 1: 녹음 시각. 해석하지 못하면 오늘 날짜로 대신하지 않고 쓰지 않는다.
+                date = check_recorded_time(file)
+                passed.add("recorded_time")
                 if not has_summary(file.get("note_list")) and not args.force:
                     now = dt.datetime.now()
                     keep_waiting, seen = wait_status(pending, fid, now, wait, args.dry_run)
@@ -576,17 +764,19 @@ def run(args):
                             log("[dry-run] 요약 대기: %s (전사 완료 확인 %s, 최대 %g시간)"
                                 % (title, seen.strftime("%Y-%m-%d %H:%M"), args.wait_hours))
                         continue
-                date = recorded_time(file) or dt.datetime.now()
-                if args.dry_run:
-                    tag = "" if has_summary(file.get("note_list")) else " (요약 없이)"
-                    log("[dry-run]%s %s → %s" % (tag, title, raw_filename(date, title)))
-                    continue
-                segments = fetch_transcript(client, fid)
+                # dry-run도 여기부터는 실제 실행과 같이 전사와 노트를 받아 자체 검사까지 한다(파일, state는 쓰지 않음)
+                segments = fetch_transcript(client, fid)  # 검사 2
+                passed.add("transcript_count")
                 if not segments:
                     waiting += 1
                     continue
+                check_segments(segments, file)  # 검사 3
+                passed.add("segment_fields")
                 notes = client.call_json("get_note", file_id=fid)
-                notes = notes if isinstance(notes, list) else []
+                if not isinstance(notes, list):
+                    if has_summary(file.get("note_list")):
+                        raise FormatCheckError("summary_body", "get_note 결과가 목록이 아님: %s" % str(notes)[:200])
+                    notes = []
                 bad = [n for n in notes if isinstance(n, dict) and n.get("data_content_error")]
                 missing, summary_lost = [], False
                 if bad:
@@ -594,8 +784,8 @@ def run(args):
                     errors = "; ".join(str(n["data_content_error"])[:200] for n in bad)
                     if any(TRANSIENT_RE.search(str(n["data_content_error"])) for n in bad):
                         raise RuntimeError("노트 본문을 가져오지 못함(일시적 오류): %s" % errors)
-                    count = record_failure(failures, fid, errors)
-                    save_state(state)
+                    count = record_failure(failures, fid, errors)  # dry-run이면 메모리에서만 센다
+                    save()
                     if count < args.max_retries:
                         raise RuntimeError("노트 본문을 가져오지 못함(연속 %d/%d번): %s"
                                            % (count, args.max_retries, errors))
@@ -606,16 +796,21 @@ def run(args):
                     summary_lost = any(is_summary_note(n) for n in bad)
                     log("노트 본문을 연속 %d번 가져오지 못해 그 노트 없이 진행: %s (%s)" % (count, title, errors))
                 elif failures.pop(fid, None) is not None:
-                    save_state(state)  # 노트를 가져왔으니 실패 횟수 초기화
+                    save()  # 노트를 가져왔으니 실패 횟수 초기화
+                notes = [n for n in notes if isinstance(n, dict)]
+                check_summary(file, notes, summary_lost)  # 검사 4
+                passed.add("summary_body")
                 reason = None
                 if not has_summary(notes):
                     if args.force:
                         reason = "--force로 요약을 기다리지 않고 내보냈습니다."
                     else:
-                        keep_waiting, _ = wait_status(pending, fid, dt.datetime.now(), wait, False)
+                        keep_waiting, _ = wait_status(pending, fid, dt.datetime.now(), wait, args.dry_run)
                         if keep_waiting:  # 요약 본문을 못 가져온 경우도 요약이 없는 것으로 보고 기다린다
                             summary_waiting += 1
-                            save_state(state)
+                            save()
+                            if args.dry_run:
+                                log("[dry-run] 요약 대기: %s (노트에 요약 없음)" % title)
                             continue
                         if summary_lost:
                             reason = ("AI 요약 노트 본문을 가져오지 못한 채 전사가 끝난 뒤 %g시간이 지나 전사만 넣었습니다."
@@ -623,7 +818,14 @@ def run(args):
                         else:
                             reason = "전사가 끝난 뒤 %g시간 안에 요약이 만들어지지 않아 전사만 넣었습니다." % args.wait_hours
                 name = raw_filename(date, title)
-                write_new_file(name, render(file, notes, segments, reason, missing))
+                content = render(file, notes, segments, reason, missing)
+                check_rendered(content, fid, len(segments))  # 검사 5
+                passed.add("rendered_file")
+                if args.dry_run:
+                    planned += 1
+                    log("[dry-run]%s %s → %s (자체 검사 통과)" % (" (요약 없이)" if reason else "", title, name))
+                    continue
+                write_new_file(name, content)
                 exported[fid] = {"file": name, "at": dt.datetime.now().isoformat(timespec="seconds")}
                 pending.pop(fid, None)
                 failures.pop(fid, None)
@@ -633,6 +835,10 @@ def run(args):
                 done += 1
             except AuthError:
                 raise
+            except FormatCheckError as e:
+                # 형식 변경 의심: 쓰지 않고, exported에 넣지 않고, 대기 기록도 지우지 않는다(안전장치 삭제도 하지 않음)
+                format_failed.setdefault(e.check, "%s: %s" % (fid, e.detail))
+                log_format_failure(e, fid)
             except Exception as e:  # 한 건 실패해도 나머지는 계속, 다음 실행에서 재시도
                 # OSError(MCP 서버 종료, 응답 시간 초과, 파이프 끊김, 로컬 파일 오류 등)도 녹음 문제가 아니므로 일시적으로 본다
                 transient = isinstance(e, OSError) or TRANSIENT_RE.search(str(e))
@@ -644,13 +850,52 @@ def run(args):
                 log("실패(다음 실행에 재시도) %s: %s" % (fid, e))
         if authed and state.pop("auth_notified_at", None) is not None and not args.dry_run:
             save_state(state)  # 다시 로그인됨 → 다음 만료 때 다시 알린다
-        log("완료: 새로 %d건, 전사 대기 %d건, 요약 대기 %d건, 실패 %d건"
-            % (done, waiting, summary_waiting, failed))
+        update_format_alerts(state, passed, format_failed, args.dry_run)
+        n_format = len(format_failed)
+        if args.dry_run:
+            log("[dry-run] 완료: 내보낼 예정 %d건, 전사 대기 %d건, 요약 대기 %d건, 실패 %d건, 형식 검사 실패 %d종"
+                % (planned, waiting, summary_waiting, failed, n_format))
+        else:
+            log("완료: 새로 %d건, 전사 대기 %d건, 요약 대기 %d건, 실패 %d건, 형식 검사 실패 %d종"
+                % (done, waiting, summary_waiting, failed, n_format))
         if done:
             notify("새 녹음 %d건을 raw에 넣었어요" % done)
+        if format_failed:
+            return EXIT_FORMAT
         return 1 if failed else 0
     finally:
         client.close()
+
+
+def log_format_failure(e, where):
+    log("형식 검사 실패(%s) %s: %s. 파일을 만들지 않았습니다. Plaud MCP 응답 형식이 바뀐 것 같습니다. "
+        "이 도구를 최신으로 업데이트하거나 이슈를 남겨 주세요" % (e.check, where, " ".join(str(e.detail).split())))
+
+
+def update_format_alerts(state, passed, failed, dry_run):
+    """형식 검사 알림은 검사 이름마다 한 번만 띄운다(state["format_alerts"][검사] = 처음 실패한 시각).
+    어떤 실행에서 그 검사가 한 번 이상 통과하고 한 번도 실패하지 않으면 기록을 지워, 다음에 다시
+    실패하면 또 알린다. 로그는 매번 남긴다. dry-run은 알림도 state 쓰기도 하지 않는다."""
+    if dry_run:
+        return
+    alerts = state.get("format_alerts")
+    alerts = alerts if isinstance(alerts, dict) else {}
+    cleared = [c for c in alerts if c in passed and c not in failed]
+    for c in cleared:
+        del alerts[c]
+        log("형식 검사 다시 통과: %s (알림 기록 해제)" % c)
+    new = [c for c in failed if c not in alerts]
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    for c in new:
+        alerts[c] = now
+    if new:
+        notify("Plaud 응답 형식이 바뀐 것 같아 저장을 멈췄어요(%s). sync.log를 확인하세요" % ", ".join(new))
+    if cleared or new:
+        if alerts:
+            state["format_alerts"] = alerts
+        else:
+            state.pop("format_alerts", None)
+        save_state(state)
 
 
 def notify_auth_once(dry_run):
