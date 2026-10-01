@@ -1,0 +1,7 @@
+state.json
+sync.log
+launchd.err
+.sync.lock
+.export.tmp
+__pycache__/
+.DS_Store
